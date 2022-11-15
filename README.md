@@ -136,3 +136,88 @@ Nov 14 05:25:02 log systemd[1]: Started The nginx HTTP and reverse proxy server.
 ```
 
 * Чтобы удалить модуль, нужно выполнить команду ```semodule -r httpd_add```. Чтобы выключить модуль ```semodule -d -v httpd_add```. Включить модуль ```semodule -e -v httpd_add```
+
+
+### 2. Обеспечить работоспособность приложения при включенном selinux. ####
+
+Проанализируем логи с помощью утилит audit2why.
+```
+[root@ns01 vagrant]# audit2why < /var/log/audit/audit.log
+type=AVC msg=audit(1668519591.094:1992): avc:  denied  { create } for  pid=5315 comm="isc-worker0000" name="named.ddns.lab.view1.jnl" scontext=system_u:system_r:named_t:s0 tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+		You can use audit2allow to generate a loadable module to allow this access.
+
+type=AVC msg=audit(1668519621.681:1993): avc:  denied  { create } for  pid=5315 comm="isc-worker0000" name="named.ddns.lab.view1.jnl" scontext=system_u:system_r:named_t:s0 tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+		You can use audit2allow to generate a loadable module to allow this access.
+```
+Гуглим ошибку и натыкаемся на статью с похожей проблемой: https://bugzilla.redhat.com/show_bug.cgi?id=518749. 
+Посмотрим SELinux context динамической директории:
+```
+[root@ns01 ~]# ls -dZ /etc/named/dynamic/
+drw-rwx---. root named unconfined_u:object_r:etc_t:s0   /etc/named/dynamic/
+```
+Видим тип etc_t, а должен быть named_cache_t (https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/selinux_users_and_administrators_guide/sect-managing_confined_services-bind-configuration_examples) 
+
+Поменяем контекст командами:
+```
+[root@ns01 ~]# semanage fcontext -a -t named_cache_t "/etc/named/dynamic(/.*)?"
+[root@ns01 ~]# restorecon -R -v /etc/named/dynamic/
+```
+Еще раз проверим контекст:
+```
+[root@ns01 ~]# ls -dZ /etc/named/dynamic/
+drw-rwx---. root named unconfined_u:object_r:named_cache_t:s0 /etc/named/dynamic/
+```
+Теперь контекст корректный.
+
+Пробуем изменить зону:
+```
+[vagrant@client ~]$ nsupdate -k /etc/named.zonetransfer.key
+> server 192.168.50.10
+> zone ddns.lab
+> update add www.ddns.lab. 60 A 192.168.50.15
+> send
+> quit
+
+[vagrant@client ~]$ rndc -c ~/rndc.conf reload
+server reload successful
+
+[vagrant@client ~]$ dig @192.168.50.10 www.ddns.lab
+
+; <<>> DiG 9.11.4-P2-RedHat-9.11.4-26.P2.el7_9.10 <<>> @192.168.50.10 www.ddns.lab
+; (1 server found)
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 35357
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 1, ADDITIONAL: 2
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 4096
+;; QUESTION SECTION:
+;www.ddns.lab.			IN	A
+
+;; ANSWER SECTION:
+www.ddns.lab.		60	IN	A	192.168.50.15
+
+;; AUTHORITY SECTION:
+ddns.lab.		3600	IN	NS	ns01.dns.lab.
+
+;; ADDITIONAL SECTION:
+ns01.dns.lab.		3600	IN	A	192.168.50.10
+
+;; Query time: 0 msec
+;; SERVER: 192.168.50.10#53(192.168.50.10)
+;; WHEN: Tue Nov 15 14:07:00 UTC 2022
+;; MSG SIZE  rcvd: 96
+```
+Зона успешно обновлена.
+
+* Также для решения проблемы можно с помошью audit2allow создать разрешающий модуль, но данный способ не является оптимальным, потому что можно предоставить какому-либо приложению слишком широкие полномочия.
+* Ещё одним способом решить проблему является полное отключение SELinux, но это также отрицательно скажется на безопасности системы.
